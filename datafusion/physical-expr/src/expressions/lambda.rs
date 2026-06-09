@@ -43,6 +43,11 @@ pub struct LambdaExpr {
     body: Arc<dyn PhysicalExpr>,
     projected_body: Arc<dyn PhysicalExpr>,
     projection: Vec<usize>,
+    /// Number of columns in the outer input schema. Column/LambdaVariable
+    /// indices below this value reference outer captures; indices at or above
+    /// reference lambda parameters (whose position in the merged evaluation
+    /// batch is fixed by the higher-order function, not by the projection).
+    outer_columns_count: usize,
 }
 
 // Manually derive PartialEq and Hash to work around https://github.com/rust-lang/rust/issues/78808 [https://github.com/apache/datafusion/issues/13196]
@@ -60,8 +65,19 @@ impl Hash for LambdaExpr {
 }
 
 impl LambdaExpr {
-    /// Create a new lambda expression with the given parameters and body
-    pub fn try_new(params: Vec<String>, body: Arc<dyn PhysicalExpr>) -> Result<Self> {
+    /// Create a new lambda expression with the given parameters and body.
+    ///
+    /// `outer_columns_count` is the number of columns in the outer input
+    /// schema this lambda was planned against. Column/LambdaVariable indices
+    /// strictly below `outer_columns_count` reference outer captures and get
+    /// compressed to the front of the evaluation batch; indices at or above
+    /// reference lambda parameters and keep their fixed position relative to
+    /// the captures (so unused lambda parameters do not shift used ones).
+    pub fn try_new(
+        params: Vec<String>,
+        body: Arc<dyn PhysicalExpr>,
+        outer_columns_count: usize,
+    ) -> Result<Self> {
         if !all_unique(&params) {
             return plan_err!(
                 "lambda params must be unique, got ({})",
@@ -71,10 +87,14 @@ impl LambdaExpr {
 
         check_async_udf(&body)?;
 
-        Ok(Self::new(params, body))
+        Ok(Self::new(params, body, outer_columns_count))
     }
 
-    fn new(params: Vec<String>, body: Arc<dyn PhysicalExpr>) -> Self {
+    fn new(
+        params: Vec<String>,
+        body: Arc<dyn PhysicalExpr>,
+        outer_columns_count: usize,
+    ) -> Self {
         let mut used_column_indices = HashSet::new();
 
         body.apply(|node| {
@@ -92,10 +112,26 @@ impl LambdaExpr {
 
         projection.sort();
 
+        // Captures (outer column refs) get compressed to the front of the
+        // merged batch. Lambda variables (indices >= outer_columns_count)
+        // keep their fixed offset from the start of the lambda parameter
+        // block, because the higher-order function always pushes all
+        // declared parameters into the merged batch in order.
+        let used_captures_count = projection
+            .iter()
+            .filter(|i| **i < outer_columns_count)
+            .count();
         let column_index_map = projection
             .iter()
             .enumerate()
-            .map(|(projected, original)| (*original, projected))
+            .map(|(captures_pos, original)| {
+                let projected = if *original < outer_columns_count {
+                    captures_pos
+                } else {
+                    used_captures_count + (*original - outer_columns_count)
+                };
+                (*original, projected)
+            })
             .collect::<HashMap<_, _>>();
 
         let projected_body = Arc::clone(&body)
@@ -129,6 +165,7 @@ impl LambdaExpr {
             body,
             projected_body,
             projection,
+            outer_columns_count,
         }
     }
 
@@ -187,7 +224,11 @@ impl PhysicalExpr for LambdaExpr {
 
         check_async_udf(body)?;
 
-        Ok(Arc::new(Self::new(self.params.clone(), Arc::clone(body))))
+        Ok(Arc::new(Self::new(
+            self.params.clone(),
+            Arc::clone(body),
+            self.outer_columns_count,
+        )))
     }
 
     fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -195,14 +236,19 @@ impl PhysicalExpr for LambdaExpr {
     }
 }
 
-/// Create a lambda expression
+/// Create a lambda expression.
+///
+/// `outer_columns_count` is the number of columns in the outer input schema
+/// this lambda was planned against. See [`LambdaExpr::try_new`] for details.
 pub fn lambda(
     params: impl IntoIterator<Item = impl Into<String>>,
     body: Arc<dyn PhysicalExpr>,
+    outer_columns_count: usize,
 ) -> Result<Arc<dyn PhysicalExpr>> {
     Ok(Arc::new(LambdaExpr::try_new(
         params.into_iter().map(Into::into).collect(),
         body,
+        outer_columns_count,
     )?))
 }
 
@@ -234,19 +280,99 @@ fn check_async_udf(body: &Arc<dyn PhysicalExpr>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::expressions::{NoOp, lambda::lambda};
-    use arrow::{array::RecordBatch, datatypes::Schema};
+    use crate::expressions::{Column, LambdaVariable, NoOp, lambda::lambda};
+    use arrow::{
+        array::RecordBatch,
+        datatypes::{DataType, Field, Schema},
+    };
     use std::sync::Arc;
+
+    use super::LambdaExpr;
 
     #[test]
     fn test_lambda_evaluate() {
-        let lambda = lambda(["a"], Arc::new(NoOp::new())).unwrap();
+        let lambda = lambda(["a"], Arc::new(NoOp::new()), 0).unwrap();
         let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
         assert!(lambda.evaluate(&batch).is_err());
     }
 
     #[test]
     fn test_lambda_duplicate_name() {
-        assert!(lambda(["a", "a"], Arc::new(NoOp::new())).is_err());
+        assert!(lambda(["a", "a"], Arc::new(NoOp::new()), 0).is_err());
+    }
+
+    /// Multi-parameter lambdas that reference only a subset of their declared
+    /// parameters must NOT shift the used parameter into the slot of an
+    /// unused one. The higher-order function pushes all declared parameters
+    /// into the merged batch in order, so a lambda `(k, v) -> v` (with `v` at
+    /// LambdaVariable index 1) must keep its body referencing index 1, not
+    /// get re-projected to index 0 just because `k` is unused.
+    #[test]
+    fn test_multi_param_lambda_keeps_param_positions_stable() {
+        let v_field = Arc::new(Field::new("v", DataType::Int32, true));
+        let body = Arc::new(LambdaVariable::new(1, Arc::clone(&v_field)));
+
+        let lambda = LambdaExpr::try_new(
+            vec!["k".to_string(), "v".to_string()],
+            body,
+            0, // no outer captures
+        )
+        .unwrap();
+
+        assert_eq!(lambda.projection(), &[1]);
+
+        let projected_var = lambda
+            .projected_body()
+            .downcast_ref::<LambdaVariable>()
+            .expect("projected body should be a LambdaVariable");
+        assert_eq!(projected_var.index(), 1);
+    }
+
+    /// With outer captures, used outer columns get compressed to the front of
+    /// the projected batch, but lambda parameter positions stay at their
+    /// fixed offset from the start of the lambda parameter block (so an
+    /// unused parameter still leaves a gap rather than shifting later ones).
+    #[test]
+    fn test_lambda_compresses_outer_captures_but_pins_params() {
+        // outer schema has 5 columns (indices 0..=4); lambda has 2 params at
+        // indices 5 and 6. Body references outer column 3 and the second
+        // lambda param (`v` at index 6); the first lambda param (`k` at 5)
+        // is unused.
+        let v_field = Arc::new(Field::new("v", DataType::Int32, true));
+        let body = Arc::new(crate::expressions::BinaryExpr::new(
+            Arc::new(Column::new("c3", 3)),
+            datafusion_expr::Operator::Plus,
+            Arc::new(LambdaVariable::new(6, Arc::clone(&v_field))),
+        ));
+
+        let lambda = LambdaExpr::try_new(
+            vec!["k".to_string(), "v".to_string()],
+            body,
+            5, // outer_columns_count
+        )
+        .unwrap();
+
+        // Both originals are referenced (3 and 6), projection is sorted.
+        assert_eq!(lambda.projection(), &[3, 6]);
+
+        // After projection:
+        //   outer col 3   -> position 0 (compressed to the captures block)
+        //   lambda var 6  -> position 2 (used_captures=1 + (6 - 5))
+        //                    NOT position 1, because the unused `k` (var 5)
+        //                    still occupies its slot.
+        let binary = lambda
+            .projected_body()
+            .downcast_ref::<crate::expressions::BinaryExpr>()
+            .expect("projected body should be a BinaryExpr");
+        let left = binary
+            .left()
+            .downcast_ref::<Column>()
+            .expect("left should be a Column");
+        let right = binary
+            .right()
+            .downcast_ref::<LambdaVariable>()
+            .expect("right should be a LambdaVariable");
+        assert_eq!(left.index(), 0);
+        assert_eq!(right.index(), 2);
     }
 }
